@@ -1,13 +1,11 @@
 import streamlit as st
 import pandas as pd
-import numpy as np
-
-from scipy.optimize import milp, LinearConstraint, Bounds
+from collections import deque
 
 
-# ------------------------------------------------------------------
-# 1. DASHBOARD CONFIGURATION
-# ------------------------------------------------------------------
+# ================================================================
+# 1. PAGE CONFIGURATION
+# ================================================================
 
 st.set_page_config(
     page_title="Industrial Slitting Optimizer (mm)",
@@ -32,9 +30,9 @@ st.markdown(
 st.title("🏭 Industrial Cutting & Slitting Optimizer (Metric)")
 
 
-# ------------------------------------------------------------------
-# 2. SIDEBAR INPUTS
-# ------------------------------------------------------------------
+# ================================================================
+# 2. SIDEBAR - INPUT PARAMETERS
+# ================================================================
 
 with st.sidebar:
 
@@ -50,9 +48,9 @@ with st.sidebar:
         "150, 200, 250"
     )
 
-    # --------------------------------------------------------------
-    # Convert inputs
-    # --------------------------------------------------------------
+    # ------------------------------------------------------------
+    # Convert user input
+    # ------------------------------------------------------------
 
     try:
 
@@ -76,9 +74,9 @@ with st.sidebar:
 
         st.stop()
 
-    # --------------------------------------------------------------
-    # Validate inputs
-    # --------------------------------------------------------------
+    # ------------------------------------------------------------
+    # Validate input
+    # ------------------------------------------------------------
 
     if not large_rolls:
 
@@ -113,14 +111,13 @@ with st.sidebar:
         st.stop()
 
     # Remove duplicate customer sizes
-
     customer_sizes = list(
         dict.fromkeys(customer_sizes)
     )
 
-    # --------------------------------------------------------------
+    # ------------------------------------------------------------
     # Order quantities
-    # --------------------------------------------------------------
+    # ------------------------------------------------------------
 
     order_demand = {}
 
@@ -136,9 +133,9 @@ with st.sidebar:
         )
 
 
-# ------------------------------------------------------------------
+# ================================================================
 # 3. CUTTING PATTERN GENERATOR
-# ------------------------------------------------------------------
+# ================================================================
 
 def generate_cutting_patterns(
     roll_width,
@@ -148,14 +145,13 @@ def generate_cutting_patterns(
 ):
 
     patterns = []
-
     brake_triggered = False
 
     def backtrack(i, used, counts):
 
         nonlocal brake_triggered
 
-        # Safety limit
+        # Safety brake
         if len(patterns) >= limit:
 
             brake_triggered = True
@@ -166,9 +162,8 @@ def generate_cutting_patterns(
 
             scrap = roll_width - used
 
-            # Keep patterns where remaining scrap is
-            # smaller than the smallest customer width.
-
+            # Keep patterns with scrap less than
+            # the smallest customer size
             if 0 <= scrap < min_size:
 
                 patterns.append(
@@ -177,21 +172,21 @@ def generate_cutting_patterns(
 
             return
 
-        # Maximum number of current size pieces
+        # Maximum pieces of current size
         max_cuts = (
             (roll_width - used)
             // sizes[i]
         )
 
-        for c in range(max_cuts + 1):
+        for count in range(max_cuts + 1):
 
             if brake_triggered:
                 break
 
             backtrack(
                 i + 1,
-                used + c * sizes[i],
-                counts + [c]
+                used + count * sizes[i],
+                counts + [count]
             )
 
     backtrack(
@@ -207,135 +202,203 @@ def generate_cutting_patterns(
     return patterns, False
 
 
-# ------------------------------------------------------------------
-# 4. MILP OPTIMIZATION USING SCIPY
-# ------------------------------------------------------------------
+# ================================================================
+# 4. REMOVE DUPLICATE PATTERNS
+# ================================================================
+
+def remove_duplicate_patterns(patterns):
+
+    return list(
+        dict.fromkeys(patterns)
+    )
+
+
+# ================================================================
+# 5. CUTTING-STOCK OPTIMIZER
+# ================================================================
 
 def optimize_patterns(
     patterns,
     customer_sizes,
-    order_demand
+    order_demand,
+    max_states=500000
 ):
 
+    """
+    Dynamic-programming solution for the cutting-stock problem.
+
+    Each state represents how much of every customer demand
+    has already been fulfilled.
+
+    The algorithm minimizes the number of master reels.
+    """
+
     if not patterns:
+
         return None
 
-    number_patterns = len(patterns)
+    # ------------------------------------------------------------
+    # Demand vector
+    # ------------------------------------------------------------
+
+    demands = tuple(
+        int(order_demand[size])
+        for size in customer_sizes
+    )
+
     number_sizes = len(customer_sizes)
 
-    # --------------------------------------------------------------
-    # Objective:
-    # Minimize number of master reels
-    # --------------------------------------------------------------
+    # ------------------------------------------------------------
+    # Keep only patterns that actually produce material
+    # ------------------------------------------------------------
 
-    objective = np.ones(
-        number_patterns,
-        dtype=float
-    )
+    useful_patterns = [
+        pattern
+        for pattern in patterns
+        if sum(pattern) > 0
+    ]
 
-    # --------------------------------------------------------------
-    # Constraint matrix
-    #
-    # Each row = customer size
-    # Each column = cutting pattern
-    # --------------------------------------------------------------
-
-    A = np.array(
-        [
-            [
-                patterns[j][i]
-                for j in range(number_patterns)
-            ]
-            for i in range(number_sizes)
-        ],
-        dtype=float
-    )
-
-    # Demand constraints:
-    #
-    # A @ x >= demand
-    #
-    # scipy LinearConstraint:
-    # lower <= A @ x <= upper
-
-    demand = np.array(
-        [
-            order_demand[size]
-            for size in customer_sizes
-        ],
-        dtype=float
-    )
-
-    constraints = LinearConstraint(
-        A,
-        demand,
-        np.full(
-            number_sizes,
-            np.inf
-        )
-    )
-
-    # --------------------------------------------------------------
-    # Integer variables
-    # --------------------------------------------------------------
-
-    integrality = np.ones(
-        number_patterns,
-        dtype=int
-    )
-
-    # Variables must be >= 0
-    # Upper bound is infinity
-
-    bounds = Bounds(
-        np.zeros(number_patterns),
-        np.full(
-            number_patterns,
-            np.inf
-        )
-    )
-
-    # --------------------------------------------------------------
-    # Solve MILP
-    # --------------------------------------------------------------
-
-    result = milp(
-        c=objective,
-        integrality=integrality,
-        bounds=bounds,
-        constraints=constraints,
-        options={
-            "time_limit": 30
-        }
-    )
-
-    # --------------------------------------------------------------
-    # Check result
-    # --------------------------------------------------------------
-
-    if not result.success:
+    if not useful_patterns:
 
         return {
             "success": False,
-            "message": result.message
+            "message": "No useful cutting patterns were generated."
         }
 
-    # Round integer solution
-    solution = np.rint(
-        result.x
-    ).astype(int)
+    patterns = useful_patterns
+
+    # ------------------------------------------------------------
+    # Starting state
+    # ------------------------------------------------------------
+
+    start = tuple(
+        0
+        for _ in range(number_sizes)
+    )
+
+    queue = deque([start])
+
+    distance = {
+        start: 0
+    }
+
+    parent = {}
+
+    final_state = None
+
+    # ------------------------------------------------------------
+    # Breadth-first search
+    #
+    # Every level represents one additional master reel.
+    # Therefore the first target reached uses the minimum
+    # number of reels.
+    # ------------------------------------------------------------
+
+    while queue:
+
+        current = queue.popleft()
+
+        current_distance = distance[current]
+
+        for pattern_index, pattern in enumerate(patterns):
+
+            new_state = tuple(
+                min(
+                    demands[i],
+                    current[i] + pattern[i]
+                )
+                for i in range(number_sizes)
+            )
+
+            # Pattern adds nothing useful
+            if new_state == current:
+                continue
+
+            # New state
+            if new_state not in distance:
+
+                distance[new_state] = (
+                    current_distance + 1
+                )
+
+                parent[new_state] = (
+                    current,
+                    pattern_index
+                )
+
+                # ------------------------------------------------
+                # Target reached
+                # ------------------------------------------------
+
+                if new_state == demands:
+
+                    final_state = new_state
+                    queue.clear()
+                    break
+
+                queue.append(new_state)
+
+                # ------------------------------------------------
+                # Memory protection
+                # ------------------------------------------------
+
+                if len(distance) >= max_states:
+
+                    return {
+                        "success": False,
+                        "message": (
+                            "Optimization state limit exceeded. "
+                            "Try smaller order quantities or "
+                            "fewer customer sizes."
+                        )
+                    }
+
+        if final_state is not None:
+
+            break
+
+    # ------------------------------------------------------------
+    # No feasible solution
+    # ------------------------------------------------------------
+
+    if final_state is None:
+
+        return {
+            "success": False,
+            "message": (
+                "No feasible cutting solution was found."
+            )
+        }
+
+    # ------------------------------------------------------------
+    # Reconstruct selected patterns
+    # ------------------------------------------------------------
+
+    pattern_counts = [
+        0
+        for _ in patterns
+    ]
+
+    state = final_state
+
+    while state != start:
+
+        previous_state, pattern_index = parent[state]
+
+        pattern_counts[pattern_index] += 1
+
+        state = previous_state
 
     return {
         "success": True,
-        "solution": solution,
-        "objective": result.fun,
-        "message": result.message
+        "pattern_counts": pattern_counts,
+        "total_rolls": distance[final_state]
     }
 
 
-# ------------------------------------------------------------------
-# 5. RUN OPTIMIZATION
-# ------------------------------------------------------------------
+# ================================================================
+# 6. RUN PRODUCTION OPTIMIZATION
+# ================================================================
 
 if st.button(
     "🚀 Run Production Optimization",
@@ -348,9 +411,9 @@ if st.button(
 
     global_brake_hit = False
 
-    # --------------------------------------------------------------
-    # Check pattern generation first
-    # --------------------------------------------------------------
+    # ------------------------------------------------------------
+    # Safety check
+    # ------------------------------------------------------------
 
     for roll_width in large_rolls:
 
@@ -377,19 +440,15 @@ if st.button(
 
             break
 
-    # --------------------------------------------------------------
-    # Stop if pattern generation exceeded safety limit
-    # --------------------------------------------------------------
+    # ------------------------------------------------------------
+    # Main calculation
+    # ------------------------------------------------------------
 
     if not global_brake_hit:
 
         st.header(
             "📊 Optimization Simulation Results (mm)"
         )
-
-        # ----------------------------------------------------------
-        # Evaluate every master reel
-        # ----------------------------------------------------------
 
         for roll_width in large_rolls:
 
@@ -419,26 +478,34 @@ if st.button(
 
                 continue
 
-            # ------------------------------------------------------
-            # Run optimization
-            # ------------------------------------------------------
+            # ----------------------------------------------------
+            # Remove duplicates
+            # ----------------------------------------------------
 
-            optimization = optimize_patterns(
+            patterns = remove_duplicate_patterns(
+                patterns
+            )
+
+            # ----------------------------------------------------
+            # Optimize
+            # ----------------------------------------------------
+
+            result = optimize_patterns(
                 patterns,
                 customer_sizes,
                 order_demand
             )
 
-            if optimization is None:
+            if result is None:
 
                 st.warning(
-                    f"No optimization model could be created "
-                    f"for {roll_width} mm."
+                    f"No optimization result for "
+                    f"{roll_width} mm."
                 )
 
                 continue
 
-            if not optimization["success"]:
+            if not result["success"]:
 
                 st.warning(
                     f"⚠️ Optimization failed for "
@@ -446,34 +513,30 @@ if st.button(
                 )
 
                 st.info(
-                    optimization["message"]
+                    result["message"]
                 )
 
                 continue
 
-            solution = optimization[
-                "solution"
+            pattern_counts = result[
+                "pattern_counts"
             ]
 
-            # ------------------------------------------------------
-            # Calculate total reels
-            # ------------------------------------------------------
+            total_rolls = result[
+                "total_rolls"
+            ]
 
-            total_rolls = int(
-                np.sum(solution)
-            )
+            # ----------------------------------------------------
+            # Material calculation
+            # ----------------------------------------------------
 
-            # ------------------------------------------------------
-            # Gross material consumption
-            # ------------------------------------------------------
-
-            total_material = int(
+            total_material = (
                 total_rolls * roll_width
             )
 
-            # ------------------------------------------------------
-            # Pattern details
-            # ------------------------------------------------------
+            # ----------------------------------------------------
+            # Calculate scrap
+            # ----------------------------------------------------
 
             pattern_rows = []
 
@@ -481,14 +544,11 @@ if st.button(
 
             for j, pattern in enumerate(patterns):
 
-                count = int(
-                    solution[j]
-                )
+                count = pattern_counts[j]
 
                 if count <= 0:
                     continue
 
-                # Material actually used
                 used_width = sum(
                     pattern[i] *
                     customer_sizes[i]
@@ -497,13 +557,11 @@ if st.button(
                     )
                 )
 
-                # Scrap on one master reel
                 scrap_per_roll = (
                     roll_width -
                     used_width
                 )
 
-                # Scrap generated by this pattern
                 run_scrap = (
                     scrap_per_roll *
                     count
@@ -526,9 +584,9 @@ if st.button(
                     }
                 )
 
-            # ------------------------------------------------------
+            # ----------------------------------------------------
             # Display results
-            # ------------------------------------------------------
+            # ----------------------------------------------------
 
             with st.expander(
                 f"Analysis: {roll_width} mm Master Reel Option",
@@ -568,9 +626,9 @@ if st.button(
                         "No cutting patterns were selected."
                     )
 
-            # ------------------------------------------------------
+            # ----------------------------------------------------
             # Store result
-            # ------------------------------------------------------
+            # ----------------------------------------------------
 
             simulation_results.append(
                 {
@@ -581,9 +639,9 @@ if st.button(
                 }
             )
 
-        # ----------------------------------------------------------
-        # FINAL RECOMMENDATION
-        # ----------------------------------------------------------
+        # ========================================================
+        # 7. FINAL RECOMMENDATION
+        # ========================================================
 
         if simulation_results:
 
@@ -606,9 +664,9 @@ if st.button(
                 f"{best['TotalMaterial']} mm."
             )
 
-            # ------------------------------------------------------
+            # ----------------------------------------------------
             # Summary
-            # ------------------------------------------------------
+            # ----------------------------------------------------
 
             summary_df = pd.DataFrame(
                 simulation_results
@@ -647,9 +705,9 @@ if st.button(
             )
 
 
-# ------------------------------------------------------------------
-# 6. FOOTER
-# ------------------------------------------------------------------
+# ================================================================
+# 8. FOOTER
+# ================================================================
 
 st.divider()
 
